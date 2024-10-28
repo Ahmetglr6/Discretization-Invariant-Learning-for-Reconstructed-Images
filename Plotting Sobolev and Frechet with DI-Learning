@@ -1,0 +1,179 @@
+# Parameters for FNO2d
+fno_architecture = {
+    "modes": 16,
+    "width": 32,
+    "n_layers": 4,
+    "retrain_fno": 42
+}
+
+# Initialize the models
+model_fno = FNO2d(fno_architecture, device=device).to(device)
+model_cnn = CNN().to(device)
+
+criterion = nn.MSELoss()
+classification_criterion = nn.CrossEntropyLoss()
+optimizer_fno = optim.Adam(model_fno.parameters(), lr=0.001)
+optimizer_cnn = optim.Adam(model_cnn.parameters(), lr=0.001)
+
+# Initialize error lists
+sobolev_val_l2_errors_fno = []
+frechet_val_l2_errors_fno = []
+sobolev_val_l2_errors_cnn = []
+frechet_val_l2_errors_cnn = []
+
+# Training loop
+num_epochs = 20
+for epoch in range(num_epochs):
+    model_fno.train()
+    model_cnn.train()
+    running_loss_sobolev_fno, running_loss_frechet_fno = 0.0, 0.0
+    running_loss_sobolev_cnn, running_loss_frechet_cnn = 0.0, 0.0
+
+    for blurred, original, labels in train_loader:
+        blurred, original, labels = blurred.to(device), original.to(device), labels.to(device)
+
+        # Training FNO model with Sobolev
+        optimizer_fno.zero_grad()
+        outputs_fno, class_outputs_fno = model_fno(blurred)
+        loss_sobolev_fno = sobolev_loss(outputs_fno, original, order=2, weight=0.1)
+        class_loss_fno = classification_criterion(class_outputs_fno, labels)
+        total_loss_sobolev_fno = loss_sobolev_fno + class_loss_fno
+        total_loss_sobolev_fno.backward(retain_graph=True)
+        optimizer_fno.step()
+        running_loss_sobolev_fno += loss_sobolev_fno.item()
+
+        # Training FNO model with Frechet
+        optimizer_fno.zero_grad()
+        outputs_fno, class_outputs_fno = model_fno(blurred)  # Recompute because we stepped optimizer before
+        loss_frechet_fno = frechet_loss(outputs_fno, original, weight=0.1)
+        class_loss_fno = classification_criterion(class_outputs_fno, labels)  # Need recompute since optimizer step
+        total_loss_frechet_fno = loss_frechet_fno + class_loss_fno
+        total_loss_frechet_fno.backward()
+        optimizer_fno.step()
+        running_loss_frechet_fno += loss_frechet_fno.item()
+
+        # Training CNN model with Sobolev
+        optimizer_cnn.zero_grad()
+        outputs_cnn, class_outputs_cnn = model_cnn(blurred)
+        loss_sobolev_cnn = sobolev_loss(outputs_cnn, original, order=2, weight=0.1)
+        class_loss_cnn = classification_criterion(class_outputs_cnn, labels)
+        total_loss_sobolev_cnn = loss_sobolev_cnn + class_loss_cnn
+        total_loss_sobolev_cnn.backward(retain_graph=True)
+        optimizer_cnn.step()
+        running_loss_sobolev_cnn += loss_sobolev_cnn.item()
+
+        # Training CNN model with Frechet
+        optimizer_cnn.zero_grad()
+        outputs_cnn, class_outputs_cnn = model_cnn(blurred)  # Recompute because we stepped optimizer before
+        loss_frechet_cnn = frechet_loss(outputs_cnn, original, weight=0.1)
+        class_loss_cnn = classification_criterion(class_outputs_cnn, labels)  # Need recompute since optimizer step
+        total_loss_frechet_cnn = loss_frechet_cnn + class_loss_cnn
+        total_loss_frechet_cnn.backward()
+        optimizer_cnn.step()
+        running_loss_frechet_cnn += loss_frechet_cnn.item()
+
+    # Validation
+    model_fno.eval()
+    model_cnn.eval()
+    with torch.no_grad():
+        for blurred, original, labels in val_loader:
+            blurred, original, labels = blurred.to(device), original.to(device), labels.to(device)
+
+            # Validation for FNO model
+            outputs_fno, class_outputs_fno = model_fno(blurred)
+            sobolev_norm_fno, max_abs_estimate_fno = sobolev_norm(outputs_fno, k=2, p=2)
+            embedded_norm_fno, embedded_max_abs_fno, embedded_semi_norm_fno = sobolev_norm_embedded(outputs_fno, k=2, p=2)
+
+            # Handle potential None values
+            max_abs_estimate_fno = max_abs_estimate_fno if max_abs_estimate_fno is not None else 0.0
+            embedded_semi_norm_fno = embedded_semi_norm_fno if embedded_semi_norm_fno is not None else 0.0
+
+            # Print Sobolev norm estimates
+            print(f'FNO Sobolev Norm: {sobolev_norm_fno.item()}, Max|u(x)|: {max_abs_estimate_fno}, '
+                  f'Embedded Norm: {embedded_norm_fno.item()}, Max|u(x)|: {embedded_max_abs_fno}, '
+                  f'Semi-norm: {embedded_semi_norm_fno}')
+
+            # Validation for CNN model
+            outputs_cnn, class_outputs_cnn = model_cnn(blurred)
+            sobolev_norm_cnn, max_abs_estimate_cnn = sobolev_norm(outputs_cnn, k=2, p=2)
+            embedded_norm_cnn, embedded_max_abs_cnn, embedded_semi_norm_cnn = sobolev_norm_embedded(outputs_cnn, k=2, p=2)
+
+            # Handle potential None values
+            max_abs_estimate_cnn = max_abs_estimate_cnn if max_abs_estimate_cnn is not None else 0.0
+            embedded_semi_norm_cnn = embedded_semi_norm_cnn if embedded_semi_norm_cnn is not None else 0.0
+
+            # Print Sobolev norm estimates
+            print(f'CNN Sobolev Norm: {sobolev_norm_cnn.item()}, Max|u(x)|: {max_abs_estimate_cnn}, '
+                  f'Embedded Norm: {embedded_norm_cnn.item()}, Max|u(x)|: {embedded_max_abs_cnn}, '
+                  f'Semi-norm: {embedded_semi_norm_cnn}')
+
+    # Example of calculating average values for presentation (replace with your actual computations)
+    avg_val_sobolev_norm_fno = running_loss_sobolev_fno / len(train_loader)  # Produce an average loss over the validation set
+    avg_val_frechet_norm_fno = running_loss_frechet_fno / len(train_loader)
+
+    avg_val_sobolev_norm_cnn = running_loss_sobolev_cnn / len(train_loader)  # Produce an average loss over the validation set
+    avg_val_frechet_norm_cnn = running_loss_frechet_cnn / len(train_loader)
+
+    sobolev_val_l2_errors_fno.append(avg_val_sobolev_norm_fno)
+    frechet_val_l2_errors_fno.append(avg_val_frechet_norm_fno)
+
+    sobolev_val_l2_errors_cnn.append(avg_val_sobolev_norm_cnn)
+    frechet_val_l2_errors_cnn.append(avg_val_frechet_norm_cnn)
+
+# Plotting the errors
+epochs = list(range(1, num_epochs + 1))
+
+# Plotting Sobolev L2 Norm errors across epochs for both models
+plt.figure(figsize=(10, 5))
+plt.plot(epochs, sobolev_val_l2_errors_fno, label='FNO Sobolev Norm')
+plt.plot(epochs, sobolev_val_l2_errors_cnn, label='CNN Sobolev Norm')
+plt.xlabel('Epoch')
+plt.ylabel('Sobolev L2 Error')
+plt.title('Sobolev Norm across Epochs for Discretization Invariant Learning')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10, 5))
+plt.plot(epochs, frechet_val_l2_errors_fno, label='FNO Frechet')
+plt.plot(epochs, frechet_val_l2_errors_cnn, label='CNN Frechet')
+plt.xlabel('Epoch')
+plt.ylabel('Frechet L2 Error')
+plt.title('Frechet across Epochs for Discretization Invariant Learning')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# Visualization function
+def visualize_images(original_images, blurred_images, deblurred_images_fno, deblurred_images_cnn, num_images=5):
+    fig, axs = plt.subplots(4, num_images, figsize=(15, 10))
+    for i in range(num_images):
+        axs[0, i].imshow(original_images[i].squeeze().cpu(), cmap='gray')
+        axs[0, i].set_title('Original')
+        axs[0, i].axis('off')
+
+        axs[1, i].imshow(blurred_images[i].squeeze().cpu(), cmap='gray')
+        axs[1, i].set_title('Blurred')
+        axs[1, i].axis('off')
+
+        axs[2, i].imshow(deblurred_images_fno[i].squeeze().cpu(), cmap='gray')
+        axs[2, i].set_title('Deblurred (FNO)')
+        axs[2, i].axis('off')
+
+        axs[3, i].imshow(deblurred_images_cnn[i].squeeze().cpu(), cmap='gray')
+        axs[3, i].set_title('Deblurred (CNN)')
+        axs[3, i].axis('off')
+
+    plt.show()
+
+# Example of visualizing images
+with torch.no_grad():
+    model_fno.eval()
+    model_cnn.eval()
+    blurred_sample, original_sample, label_sample = next(iter(val_loader))
+    blurred_sample, original_sample = blurred_sample.to(device), original_sample.to(device)
+    deblurred_sample_sobolev_fno, _ = model_fno(blurred_sample)
+    deblurred_sample_sobolev_cnn, _ = model_cnn(blurred_sample)
+
+    visualize_images(original_sample, blurred_sample, deblurred_sample_sobolev_fno, deblurred_sample_sobolev_cnn)
