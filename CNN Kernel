@@ -1,0 +1,88 @@
+import numpy as np
+import torch
+import torch.fft as fft
+import torchvision.transforms.functional as TF
+import torch.nn.functional as tf
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+# Set device for computation
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# Initialize the CNN
+class BasicBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size=1, stride=1):
+        super(BasicBlock, self).__init__()
+        if isinstance(kernel_size, tuple):
+            padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+        else:
+            padding = kernel_size // 2
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size, stride=stride, padding=padding, padding_mode='circular', bias=False)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.relu(x)
+        return x
+
+class CNN(nn.Module):
+    def __init__(self, mean=0.0, std=1.0, act_fun=nn.ReLU(),
+                 mid_channels=32, out_channels=64, kernel1=5, kernel2=5, stride=1):
+        super(CNN, self).__init__()
+        self.mean = mean
+        self.std = std
+        self.act_fun = act_fun
+        self.kernel1 = kernel1
+        self.kernel2 = kernel2
+        self.stride = stride
+        self.layer1 = BasicBlock(1, mid_channels, kernel_size=(kernel1, kernel2), stride=self.stride)
+        self.layer2 = BasicBlock(mid_channels, out_channels, kernel_size=(kernel1, kernel2), stride=self.stride)
+        self.conv3 = nn.Conv2d(out_channels, 1, kernel_size=1)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+    def forward(self, x):
+        x = (x - self.mean) / self.std
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.conv3(x)
+
+        classification_output = self.classifier(x)
+        return x, classification_output
+
+    def name(self):
+        return f'cnn-{self.kernel1}-{self.kernel2}'
+
+model_cnn = CNN().to(device)
+
+def visualize_cnn_weights(model, num_kernels=6):
+    """Visualize the learned weights of the CNN with labels."""
+    # Retrieve all BasicBlock layers from the model
+    all_layers = [layer for layer in model.children() if isinstance(layer, BasicBlock)]
+
+    fig, axs = plt.subplots(len(all_layers), num_kernels, figsize=(2 * num_kernels, 2 * len(all_layers)))
+
+    for layer_idx, layer in enumerate(all_layers):
+        weights = layer.conv.weight.data.cpu().numpy()  # Get weights of the convolutional layer
+        for kernel_idx in range(num_kernels):
+            if kernel_idx < weights.shape[0]:  # Check if the kernel index is valid
+                axs[layer_idx, kernel_idx].imshow(weights[kernel_idx, 0, :, :], cmap='gray')
+                axs[layer_idx, kernel_idx].axis('off')
+                # Create label for each kernel image
+                axs[layer_idx, kernel_idx].set_title(f'Layer {layer_idx + 1} Kernel {kernel_idx + 1}', fontsize=10)
+            else:
+                axs[layer_idx, kernel_idx].axis('off')  # Empty axis if there are fewer kernels
+
+        axs[layer_idx, 0].set_ylabel(f'Layer {layer_idx + 1}', fontsize=14)  # Label for the row
+
+    plt.tight_layout()
+    plt.show()
+
+# Visualize CNN weights with labels
+visualize_cnn_weights(model_cnn)
