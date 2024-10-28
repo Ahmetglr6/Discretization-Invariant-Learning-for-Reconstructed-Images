@@ -1,0 +1,92 @@
+# 2D Fourier layer
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        super(SpectralConv2d, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        x_ft = rfft2(x, dim=(-2, -1))
+
+        out_ft = torch.zeros(
+            batchsize, self.out_channels, x.size(-2), x.size(-1) // 2 + 1, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2] = self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes2] = self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+
+        x = irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return x
+
+# Custom Discretization Invariant Layer
+class DiscretizationInvariantLayer(nn.Module):
+    def __init__(self, channels):
+        super(DiscretizationInvariantLayer, self).__init__()
+        self.channels = channels
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x_pooled = self.adaptive_pool(x)
+        return x - x_pooled
+
+# Fourier Neural Operator with Discretization Invariant Layers
+class FNO2d(nn.Module):
+    def __init__(self, fno_architecture, device=None, padding_frac=1 / 8):
+        super(FNO2d, self).__init__()
+        self.modes1 = fno_architecture["modes"]
+        self.modes2 = fno_architecture["modes"]
+        self.width = fno_architecture["width"]
+        self.n_layers = fno_architecture["n_layers"]
+        self.retrain_fno = fno_architecture["retrain_fno"]
+
+        torch.manual_seed(self.retrain_fno)
+        self.padding_frac = padding_frac
+        self.fc0 = nn.Conv2d(1, self.width, kernel_size=1)
+        self.conv_list = nn.ModuleList([nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_layers)])
+        self.spectral_list = nn.ModuleList([SpectralConv2d(self.width, self.width, self.modes1, self.modes2) for _ in range(self.n_layers)])
+        self.discretization_invariant_list = nn.ModuleList([DiscretizationInvariantLayer(self.width) for _ in range(self.n_layers)])
+        self.fc1 = nn.Conv2d(self.width, 128, kernel_size=1)
+        self.fc2 = nn.Conv2d(128, 1, kernel_size=1)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+        self.to(device)
+
+    def forward(self, x):
+        x = self.fc0(x)
+
+        x1_padding = int(round(x.shape[-1] * self.padding_frac))
+        x2_padding = int(round(x.shape[-2] * self.padding_frac))
+        x = F.pad(x, [x1_padding, x1_padding, x2_padding, x2_padding])
+
+        for k, (s, c, d) in enumerate(zip(self.spectral_list, self.conv_list, self.discretization_invariant_list)):
+            x1 = s(x)
+            x2 = c(x)
+            x3 = d(x)
+            x = x1 + x2 + x3
+            if k != self.n_layers - 1:
+                x = F.gelu(x)
+
+        x = x[..., x2_padding:-x2_padding, x1_padding:-x1_padding]
+
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+
+        classification_output = self.classifier(x)
+        return x, classification_output
