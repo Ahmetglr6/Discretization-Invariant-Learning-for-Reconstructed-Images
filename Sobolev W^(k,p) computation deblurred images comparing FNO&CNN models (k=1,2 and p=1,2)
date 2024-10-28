@@ -1,0 +1,320 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+from torch.fft import rfft2, irfft2
+import torch.nn.functional as F
+
+# Set device for computation
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load MNIST dataset
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+full_dataset = datasets.MNIST(root='mnist_data', train=True, transform=transform, download=True)
+
+# Define the train and validation splits
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+
+# Split the dataset
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+# Create DataLoader for training and validation datasets
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# Function to apply Gaussian blur to images
+def apply_gaussian_blur(images, blur_transform):
+    blurred_images = torch.stack([blur_transform(image) for image in images])
+    return blurred_images.to(device)
+
+# Define the Gaussian blur transformation
+gaussian_blur = transforms.GaussianBlur(kernel_size=5, sigma=1.0)
+
+# Step 2: Move data to GPU in preprocessing
+def preprocess_data(loader, blur_transform):
+    blurred_images, original_images, labels = [], [], []
+    for images, lbls in loader:
+        images = images.to(device)  # Ensures images are on the same device
+        lbls = lbls.to(device)  # Ensure labels are also on the device
+        blurred_images.append(apply_gaussian_blur(images, blur_transform))
+        original_images.append(images)
+        labels.append(lbls)
+    blurred_images = torch.cat(blurred_images)
+    original_images = torch.cat(original_images)
+    labels = torch.cat(labels)
+    return blurred_images, original_images, labels
+
+# Re-run preprocessing to ensure correct device placement
+train_blurred_images, train_original_images, train_labels = preprocess_data(train_loader, gaussian_blur)
+val_blurred_images, val_original_images, val_labels = preprocess_data(val_loader, gaussian_blur)
+
+
+# Create DataLoader for blurred data
+class BlurDataset(torch.utils.data.Dataset):
+    def __init__(self, blurred_images, original_images, labels):
+        assert len(blurred_images) == len(original_images) == len(labels)
+        self.blurred_images = blurred_images
+        self.original_images = original_images
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.blurred_images)
+
+    def __getitem__(self, idx):
+        return self.blurred_images[idx], self.original_images[idx], self.labels[idx]
+
+train_dataset = BlurDataset(train_blurred_images, train_original_images, train_labels)
+val_dataset = BlurDataset(val_blurred_images, val_original_images, val_labels)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# 2D Fourier layer
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        super(SpectralConv2d, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        x_ft = rfft2(x, dim=(-2, -1))
+
+        out_ft = torch.zeros(
+            batchsize, self.out_channels, x.size(-2), x.size(-1) // 2 + 1, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2] = self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes2] = self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+
+        x = irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return x
+
+# Custom Discretization Invariant Layer
+class DiscretizationInvariantLayer(nn.Module):
+    def __init__(self, channels):
+        super(DiscretizationInvariantLayer, self).__init__()
+        self.channels = channels
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x_pooled = self.adaptive_pool(x)
+        return x - x_pooled
+
+# Fourier Neural Operator with Discretization Invariant Layers
+class FNO2d(nn.Module):
+    def __init__(self, fno_architecture, device=None, padding_frac=1 / 8):
+        super(FNO2d, self).__init__()
+        self.modes1 = fno_architecture["modes"]
+        self.modes2 = fno_architecture["modes"]
+        self.width = fno_architecture["width"]
+        self.n_layers = fno_architecture["n_layers"]
+        self.retrain_fno = fno_architecture["retrain_fno"]
+
+        torch.manual_seed(self.retrain_fno)
+        self.padding_frac = padding_frac
+        self.fc0 = nn.Conv2d(1, self.width, kernel_size=1)
+        self.conv_list = nn.ModuleList([nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_layers)])
+        self.spectral_list = nn.ModuleList([SpectralConv2d(self.width, self.width, self.modes1, self.modes2) for _ in range(self.n_layers)])
+        self.discretization_invariant_list = nn.ModuleList([DiscretizationInvariantLayer(self.width) for _ in range(self.n_layers)])
+        self.fc1 = nn.Conv2d(self.width, 128, kernel_size=1)
+        self.fc2 = nn.Conv2d(128, 1, kernel_size=1)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+        self.to(device)
+
+    def forward(self, x):
+        x = self.fc0(x)
+
+        x1_padding = int(round(x.shape[-1] * self.padding_frac))
+        x2_padding = int(round(x.shape[-2] * self.padding_frac))
+        x = F.pad(x, [x1_padding, x1_padding, x2_padding, x2_padding])
+
+        for k, (s, c, d) in enumerate(zip(self.spectral_list, self.conv_list, self.discretization_invariant_list)):
+            x1 = s(x)
+            x2 = c(x)
+            x3 = d(x)
+            x = x1 + x2 + x3
+            if k != self.n_layers - 1:
+                x = F.gelu(x)
+
+        x = x[..., x2_padding:-x2_padding, x1_padding:-x1_padding]
+
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+
+        classification_output = self.classifier(x)
+        return x, classification_output
+
+# Initialize the CNN
+class BasicBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size=1, stride=1):
+        super(BasicBlock, self).__init__()
+        if isinstance(kernel_size, tuple):
+            padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+        else:
+            padding = kernel_size // 2
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size, stride=stride, padding=padding, padding_mode='circular', bias=False)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.relu(x)
+        return x
+
+class CNN(nn.Module):
+    def __init__(self, mean=0.0, std=1.0, act_fun=nn.ReLU(),
+                 mid_channels=32, out_channels=64, kernel1=5, kernel2=5, stride=1):
+        super(CNN, self).__init__()
+        self.mean = mean
+        self.std = std
+        self.act_fun = act_fun
+        self.kernel1 = kernel1
+        self.kernel2 = kernel2
+        self.stride = stride
+        self.layer1 = BasicBlock(1, mid_channels, kernel_size=(kernel1, kernel2), stride=self.stride)
+        self.layer2 = BasicBlock(mid_channels, out_channels, kernel_size=(kernel1, kernel2), stride=self.stride)
+        self.conv3 = nn.Conv2d(out_channels, 1, kernel_size=1)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+    def forward(self, x):
+        x = (x - self.mean) / self.std
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.conv3(x)
+
+        classification_output = self.classifier(x)
+        return x, classification_output
+
+    def name(self):
+        return f'cnn-{self.kernel1}-{self.kernel2}'
+
+ # Define architecture parameters
+fno_architecture = {
+    "modes": 8,
+    "width": 16,
+    "n_layers": 4,
+    "retrain_fno": 42
+}
+# Correct instantiation of the models with the correct class names
+# Instantiate models and move them to the appropriate device
+model_fno = FNO2d(fno_architecture).to(device)
+model_cnn = CNN(mean=0.0, std=1.0, act_fun=nn.ReLU(),
+    mid_channels=32, out_channels=64, kernel1=5, kernel2=5, stride=1).to(device)
+
+
+
+def sobolev_norm(u, k, p):
+    norm = torch.tensor(0.0, device=u.device)
+    # Zeroth order term
+    norm += torch.sum(torch.abs(u) ** p) ** (1 / p)
+
+    max_abs_estimate = torch.max(torch.abs(u))
+
+    # Compute derivatives for orders up to k
+    for order in range(1, k + 1):
+        # First derivative calculation
+        du_h = F.pad(u[:, :, 1:] - u[:, :, :-1], (0, 1, 0, 0))
+        du_v = F.pad(u[:, :, :, 1:] - u[:, :, :, :-1], (0, 0, 0, 1))
+
+        # Increment norm with first derivatives
+        norm_order_1 = (torch.sum(torch.abs(du_h) ** p) ** (1 / p) +
+                        torch.sum(torch.abs(du_v) ** p) ** (1 / p))
+        norm += norm_order_1
+
+        # Prepare for higher-order derivatives if needed
+        for higher_order in range(2, order + 1):
+            du_h = F.pad(du_h[:, :, 1:] - du_h[:, :, :-1], (0, 1, 0, 0))
+            du_v = F.pad(du_v[:, :, :, 1:] - du_v[:, :, :, :-1], (0, 0, 0, 1))
+
+            norm_order_higher = (torch.sum(torch.abs(du_h) ** p) ** (1 / p) +
+                                 torch.sum(torch.abs(du_v) ** p) ** (1 / p))
+            norm += norm_order_higher
+
+    return norm, max_abs_estimate
+
+print('FNO model params on device:', next(model_fno.parameters()).device)
+print('CNN model params on device:', next(model_cnn.parameters()).device)
+
+# Function to perform deeper Sobolev analyses on validation data and print results
+def perform_deeper_sobolev_analysis(model_fno, model_cnn, val_loader, k_values, p_values, device):
+    print("Performing Sobolev analyses...")
+
+    model_fno.eval()
+    model_cnn.eval()
+
+    sobolev_results_fno = {}
+    sobolev_results_cnn = {}
+
+    with torch.no_grad():
+        for k in k_values:
+            for p in p_values:
+                for blurred, original, labels in val_loader:
+                    blurred, original, labels = blurred.to(device), original.to(device), labels.to(device)
+
+                    # FNO model analysis
+                    outputs_fno, _ = model_fno(blurred)
+                    norm_fno, max_abs_estimate_fno = sobolev_norm(outputs_fno, k=k, p=p)
+
+                    # Store results
+                    if (k, p) not in sobolev_results_fno:
+                        sobolev_results_fno[(k, p)] = []
+                    sobolev_results_fno[(k, p)].append((norm_fno.item(), max_abs_estimate_fno.item()))
+
+                    # CNN model analysis
+                    outputs_cnn, _ = model_cnn(blurred)
+                    norm_cnn, max_abs_estimate_cnn = sobolev_norm(outputs_cnn, k=k, p=p)
+
+                    # Store results
+                    if (k, p) not in sobolev_results_cnn:
+                        sobolev_results_cnn[(k, p)] = []
+                    sobolev_results_cnn[(k, p)].append((norm_cnn.item(), max_abs_estimate_cnn.item()))
+
+    # Print results for FNO
+    print("Sobolev Norm Results for FNO:")
+    for (k, p), values in sobolev_results_fno.items():
+        avg_norm = sum(v[0] for v in values) / len(values)
+        avg_max_abs = sum(v[1] for v in values) / len(values)
+        print(f"Order k={k}, p={p}: Average Norm = {avg_norm}, Average Max|u(x)| = {avg_max_abs}")
+
+    # Print results for CNN
+    print("\nSobolev Norm Results for CNN:")
+    for (k, p), values in sobolev_results_cnn.items():
+        avg_norm = sum(v[0] for v in values) / len(values)
+        avg_max_abs = sum(v[1] for v in values) / len(values)
+        print(f"Order k={k}, p={p}: Average Norm = {avg_norm}, Average Max|u(x)| = {avg_max_abs}")
+
+# Using the function with specific parameters
+k_values = [1, 2]  # Define orders to analyze
+p_values = [1, 2]  # Define norms to analyze
+
+# Run the deeper Sobolev analyses
+perform_deeper_sobolev_analysis(model_fno, model_cnn, val_loader, k_values, p_values, device)
