@@ -1,0 +1,343 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split, TensorDataset
+from torchvision import datasets, transforms
+from torch.fft import rfft2, irfft2
+import matplotlib.pyplot as plt
+
+# Set device for computation
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load and preprocess MNIST dataset
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+full_dataset = datasets.MNIST(root='mnist_data', train=True, transform=transform, download=True)
+
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# Apply Gaussian blur to images
+def apply_gaussian_blur(images, blur_transform):
+    blurred_images = torch.stack([blur_transform(image) for image in images])
+    return blurred_images.to(device)
+
+gaussian_blur = transforms.GaussianBlur(kernel_size=5, sigma=1.0)
+
+def preprocess_data(loader, blur_transform):
+    blurred_images, original_images, labels = [], [], []
+    for images, lbls in loader:
+        images = images.to(device)
+        blurred_images.append(apply_gaussian_blur(images, blur_transform))
+        original_images.append(images)
+        labels.append(lbls)
+    return torch.cat(blurred_images), torch.cat(original_images), torch.cat(labels)
+
+train_blurred_images, train_original_images, train_labels = preprocess_data(train_loader, gaussian_blur)
+val_blurred_images, val_original_images, val_labels = preprocess_data(val_loader, gaussian_blur)
+
+class BlurDataset(torch.utils.data.Dataset):
+    def __init__(self, blurred_images, original_images, labels):
+        assert len(blurred_images) == len(original_images) == len(labels)
+        self.blurred_images = blurred_images
+        self.original_images = original_images
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.blurred_images)
+
+    def __getitem__(self, idx):
+        return self.blurred_images[idx], self.original_images[idx], self.labels[idx]
+
+train_dataset = BlurDataset(train_blurred_images, train_original_images, train_labels)
+val_dataset = BlurDataset(val_blurred_images, val_original_images, val_labels)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# SpectralConv2d and Discretization Invariant Layer classes go here...
+# (They are identical to the ones defined in your script.)
+
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        super(SpectralConv2d, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        x_ft = rfft2(x, dim=(-2, -1))
+
+        out_ft = torch.zeros(
+            batchsize, self.out_channels, x.size(-2), x.size(-1) // 2 + 1, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2] = self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes2] = self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+
+        x = irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return x
+
+class DiscretizationInvariantLayer(nn.Module):
+    def __init__(self, channels):
+        super(DiscretizationInvariantLayer, self).__init__()
+        self.channels = channels
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x_pooled = self.adaptive_pool(x)
+        return x - x_pooled
+
+class FNO2d(nn.Module):
+    def __init__(self, fno_architecture, device=None, padding_frac=1 / 8):
+        super(FNO2d, self).__init__()
+        self.modes1 = fno_architecture["modes"]
+        self.modes2 = fno_architecture["modes"]
+        self.width = fno_architecture["width"]
+        self.n_layers = fno_architecture["n_layers"]
+        self.retrain_fno = fno_architecture["retrain_fno"]
+
+        torch.manual_seed(self.retrain_fno)
+        self.padding_frac = padding_frac
+        self.fc0 = nn.Conv2d(1, self.width, kernel_size=1)
+        self.conv_list = nn.ModuleList([nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_layers)])
+        self.spectral_list = nn.ModuleList([SpectralConv2d(self.width, self.width, self.modes1, self.modes2) for _ in range(self.n_layers)])
+        self.discretization_invariant_list = nn.ModuleList([DiscretizationInvariantLayer(self.width) for _ in range(self.n_layers)])
+        self.fc1 = nn.Conv2d(self.width, 128, kernel_size=1)
+        self.fc2 = nn.Conv2d(128, 1, kernel_size=1)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+        self.to(device)
+
+    def forward(self, x):
+        x = self.fc0(x)
+
+        x1_padding = int(round(x.shape[-1] * self.padding_frac))
+        x2_padding = int(round(x.shape[-2] * self.padding_frac))
+        x = F.pad(x, [x1_padding, x1_padding, x2_padding, x2_padding])
+
+        for k, (s, c, d) in enumerate(zip(self.spectral_list, self.conv_list, self.discretization_invariant_list)):
+            x1 = s(x)
+            x2 = c(x)
+            x3 = d(x)
+            x = x1 + x2 + x3
+            if k != self.n_layers - 1:
+                x = F.gelu(x)
+
+        x = x[..., x2_padding:-x2_padding, x1_padding:-x1_padding]
+
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+
+        classification_output = self.classifier(x)
+        return x, classification_output
+
+class BasicBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size=1, stride=1):
+        super(BasicBlock, self).__init__()
+        if isinstance(kernel_size, tuple):
+            padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+        else:
+            padding = kernel_size // 2
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size, stride=stride, padding=padding, padding_mode='circular', bias=False)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.relu(x)
+        return x
+
+class CNN(nn.Module):
+    def __init__(self, mean=0.0, std=1.0, act_fun=nn.ReLU(),
+                 mid_channels=32, out_channels=64, kernel1=5, kernel2=5, stride=1):
+        super(CNN, self).__init__()
+        self.mean = mean
+        self.std = std
+        self.act_fun = act_fun
+        self.kernel1 = kernel1
+        self.kernel2 = kernel2
+        self.stride = stride
+        self.layer1 = BasicBlock(1, mid_channels, kernel_size=(kernel1, kernel2), stride=self.stride)
+        self.layer2 = BasicBlock(mid_channels, out_channels, kernel_size=(kernel1, kernel2), stride=self.stride)
+        self.conv3 = nn.Conv2d(out_channels, 1, kernel_size=1)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+    def forward(self, x):
+        x = (x - self.mean) / self.std
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.conv3(x)
+
+        classification_output = self.classifier(x)
+        return x, classification_output
+
+    def name(self):
+        return f'cnn-{self.kernel1}-{self.kernel2}'
+
+# Define Sobolev Norm (L2)
+def sobolev_loss(pred, target, order=1, weight=1.0):
+    """Compute the Sobolev loss focusing on the first and higher-order derivative losses."""
+    loss = F.mse_loss(pred, target)
+
+    for i in range(1, order + 1):
+        # X derivative up to the specified order
+        diff_pred_x = torch.diff(pred, n=i, dim=-1)
+        diff_target_x = torch.diff(target, n=i, dim=-1)
+
+        # Y derivative up to the specified order
+        diff_pred_y = torch.diff(pred, n=i, dim=-2)
+        diff_target_y = torch.diff(target, n=i, dim=-2)
+
+        # Add these differences squared into loss, scaling for regularity
+        loss += weight * (F.mse_loss(diff_pred_x, diff_target_x) + F.mse_loss(diff_pred_y, diff_target_y))
+
+    return loss
+
+# Parameters for FNO2d
+fno_architecture = {
+    "modes": 16,
+    "width": 32,
+    "n_layers": 4,
+    "retrain_fno": 42
+}
+
+# Initialize the models
+model_fno = FNO2d(fno_architecture, device=device).to(device)
+model_cnn = CNN().to(device)
+
+# Optimizers and loss functions
+optimizer_fno = optim.Adam(model_fno.parameters(), lr=0.001)
+optimizer_cnn = optim.Adam(model_cnn.parameters(), lr=0.001)
+
+classification_criterion = nn.CrossEntropyLoss()
+
+num_epochs = 20
+for epoch in range(num_epochs):
+    model_fno.train()
+    model_cnn.train()
+
+    for blurred, original, labels in train_loader:
+        blurred, original, labels = blurred.to(device), original.to(device), labels.to(device)
+
+        # Train FNO model
+        optimizer_fno.zero_grad()
+        outputs_fno, class_outputs_fno = model_fno(blurred)
+        loss_sobolev_fno = sobolev_loss(outputs_fno, original, order=2, weight=0.1)
+        class_loss_fno = classification_criterion(class_outputs_fno, labels)
+        total_loss_fno = loss_sobolev_fno + class_loss_fno
+        total_loss_fno.backward()
+        optimizer_fno.step()
+
+        # Train CNN model
+        optimizer_cnn.zero_grad()
+        outputs_cnn, class_outputs_cnn = model_cnn(blurred)
+        loss_cnn = F.mse_loss(outputs_cnn, original)
+        class_loss_cnn = classification_criterion(class_outputs_cnn, labels)
+        total_loss_cnn = loss_cnn + class_loss_cnn
+        total_loss_cnn.backward()
+        optimizer_cnn.step()
+
+    # Evaluation on validation set
+    model_fno.eval()
+    model_cnn.eval()
+
+    total_correct_fno = 0
+    total_correct_cnn = 0
+    total_images = 0
+
+    with torch.no_grad():
+        for blurred, original, labels in val_loader:
+            blurred, original, labels = blurred.to(device), original.to(device), labels.to(device)
+
+            # FNO evaluation
+            deblurred_fno, class_outputs_fno = model_fno(blurred)
+            _, predicted_fno = torch.max(class_outputs_fno, 1)
+            total_correct_fno += (predicted_fno == labels).sum().item()
+
+            # CNN evaluation
+            deblurred_cnn, class_outputs_cnn = model_cnn(blurred)
+            _, predicted_cnn = torch.max(class_outputs_cnn, 1)
+            total_correct_cnn += (predicted_cnn == labels).sum().item()
+
+            total_images += labels.size(0)
+
+    accuracy_fno = total_correct_fno / total_images * 100
+    accuracy_cnn = total_correct_cnn / total_images * 100
+
+    print(f"Epoch {epoch + 1}/{num_epochs}")
+    print(f"FNO Model Accuracy: {accuracy_fno:.2f}%")
+    print(f"CNN Model Accuracy: {accuracy_cnn:.2f}%")
+
+# Resizing and further accuracy assessments
+new_dimensions = [(8, 8), (16, 16), (32, 32), (64, 64), (128, 128), (256, 256)]
+
+for new_size in new_dimensions:
+    height, width = new_size
+
+    def create_resized_dataloader(deblurred_images, labels):
+        deblurred_images = deblurred_images.cpu()
+        if deblurred_images.ndim == 3:
+            deblurred_images = deblurred_images.unsqueeze(1)
+        resized_images = F.interpolate(deblurred_images, size=(height, width), mode='bilinear', align_corners=False)
+        final_images = F.interpolate(resized_images, size=(28, 28), mode='bilinear', align_corners=False)
+
+        dataset = TensorDataset(final_images, labels)
+        return DataLoader(dataset, batch_size=64, shuffle=False)
+
+    # Need examples of deblurred outputs to create resized evaluation
+    with torch.no_grad():
+        blurred_sample, original_sample, label_sample = next(iter(val_loader))
+        blurred_sample = blurred_sample.to(device)
+        deblurred_sample_sobolev_fno, _ = model_fno(blurred_sample)
+        deblurred_sample_sobolev_cnn, _ = model_cnn(blurred_sample)
+
+    fno_loader = create_resized_dataloader(deblurred_sample_sobolev_fno, label_sample)
+    cnn_loader = create_resized_dataloader(deblurred_sample_sobolev_cnn, label_sample)
+
+    for loader, model, model_name in [(fno_loader, model_fno, "FNO"), (cnn_loader, model_cnn, "CNN")]:
+        model.eval()
+        total_correct = 0
+        total_images = 0
+
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                _, class_outputs = model(images)
+                _, predicted = torch.max(class_outputs, 1)
+
+                total_correct += (predicted == labels).sum().item()
+                total_images += labels.size(0)
+
+        accuracy = total_correct / total_images * 100
+        
