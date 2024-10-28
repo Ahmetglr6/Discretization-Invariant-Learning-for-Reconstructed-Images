@@ -1,0 +1,184 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split, Subset
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+from torch.fft import rfft2, irfft2
+import torch.nn.functional as F
+import numpy as np
+
+# Set device for computation
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load MNIST dataset and apply transforms
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+
+# Load the full MNIST dataset
+full_dataset = datasets.MNIST(root='mnist_data', train=True, transform=transform, download=True)
+
+# Split dataset into training and validation
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+# Create DataLoader for training and validation datasets
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# Verify dataset sizes
+print(f'Train Dataset size: {len(train_dataset)}')
+print(f'Validation Dataset size: {len(val_dataset)}')
+
+# Function to apply Gaussian blur to images
+def apply_gaussian_blur(images, blur_transform):
+    blurred_images = torch.stack([blur_transform(image) for image in images])
+    return blurred_images.to(device)
+
+# Define the Gaussian blur transformation
+gaussian_blur = transforms.GaussianBlur(kernel_size=5, sigma=1.0)
+
+# Preprocess data with Gaussian blur
+def preprocess_data(loader, blur_transform):
+    blurred_images = []
+    original_images = []
+    labels = []
+    for images, lbls in loader:
+        images = images.to(device)
+        blurred_images.append(apply_gaussian_blur(images, blur_transform))
+        original_images.append(images)
+        labels.append(lbls)
+    blurred_images = torch.cat(blurred_images)
+    original_images = torch.cat(original_images)
+    labels = torch.cat(labels)
+    return blurred_images, original_images, labels
+
+# Process blurred and original datasets
+train_blurred_images, train_original_images, train_labels = preprocess_data(train_loader, gaussian_blur)
+val_blurred_images, val_original_images, val_labels = preprocess_data(val_loader, gaussian_blur)
+
+# Create Dataset for blurred images
+class BlurDataset(torch.utils.data.Dataset):
+    def __init__(self, blurred_images, original_images, labels):
+        assert len(blurred_images) == len(original_images) == len(labels)
+        self.blurred_images = blurred_images
+        self.original_images = original_images
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.blurred_images)
+
+    def __getitem__(self, idx):
+        return self.blurred_images[idx], self.original_images[idx], self.labels[idx]
+
+# Create datasets for blurred images
+train_dataset_blur = BlurDataset(train_blurred_images, train_original_images, train_labels)
+val_dataset_blur = BlurDataset(val_blurred_images, val_original_images, val_labels)
+
+train_loader_blur = DataLoader(train_dataset_blur, batch_size=64, shuffle=True)
+val_loader_blur = DataLoader(val_dataset_blur, batch_size=64, shuffle=False)
+
+# FFT utilities
+def rfftshift(x):
+    return torch.conj(torch.flip(torch.fft.fftshift(x, dim=-2), dims=[-1]))
+
+def irfftshift(x):
+    return torch.conj(torch.flip(torch.fft.ifftshift(x, dim=-2), dims=[-1]))
+
+def symmetric_padding(xf_old, im_shape_old, im_shape_new):
+    add_shape = np.array(xf_old.shape[:-2])  # [batchsize, channels]
+
+    ft_height_old = im_shape_old[-2] + (1 - im_shape_old[-2] % 2)  # always odd
+    ft_width_old = im_shape_old[-1] // 2 + 1  # always odd
+    ft_height_new = im_shape_new[-2] + (1 - im_shape_new[-2] % 2)  # always odd
+    ft_width_new = im_shape_new[-1] // 2 + 1  # always odd
+    xf_shape = tuple(add_shape) + (ft_height_old, ft_width_old)
+
+    pad_height = (ft_height_new - ft_height_old) // 2
+    pad_width = (ft_width_new - ft_width_old)
+    pad_list = [pad_width, 0, pad_height, pad_height]  # (padding_left, padding_right, padding_top, padding_bottom)
+    xf = torch.zeros(size=xf_shape, dtype=torch.cfloat, device=xf_old.device)
+
+    xf[..., :im_shape_old[-2], :] = xf_old
+
+    # Handling Nyquist frequency
+    if im_shape_old[-2] % 2 == 0:
+        xf[..., 0, :] *= 0.5
+        xf[..., -1, :] = xf[..., 0, :]
+
+    if im_shape_old[-1] % 2 == 0:
+        xf[..., :, 0] *= 0.5
+
+    xf_pad = F.pad(xf, pad_list)
+
+    # Adjust nyquist frequency for even dimension
+    if im_shape_new[-2] % 2 == 0:
+        xf_pad[..., 0, :] *= 2
+
+    if im_shape_new[-1] % 2 == 0:
+        xf_pad[..., :, 0] *= 2
+
+    return xf_pad[..., :im_shape_new[-2], :]
+
+class TrigonometricResize_2d:
+    def __init__(self, shape, norm='forward', check_comp=False):
+        self.shape = shape
+        self.norm = norm
+        self.check_comp = check_comp
+
+    def __call__(self, x):
+        im_shape_new = np.array(self.shape)
+
+        if torch.is_complex(x):
+            x_inter = irfft2(rfft2(x, norm=self.norm), s=self.shape, norm=self.norm)
+        else:
+            im_shape_old = np.array(x.shape[-2:])
+            x_inter = irfft2(irfftshift(symmetric_padding(rfftshift(rfft2(x, norm=self.norm)), im_shape_old, im_shape_new)), s=tuple(im_shape_new), norm=self.norm)
+        return x_inter
+
+# Visualization function
+def visualize_padding_and_resize(images):
+    for i in range(len(images)):  # Visualizing each image one by one
+        image = images[i]
+
+        # Create synthetic complex tensor from real image for padding
+        xf_old = rfft2(image.unsqueeze(0), dim=(-2, -1))
+
+        im_shape_old = image.shape[-2:]
+        im_shape_new = (im_shape_old[0] + 4, im_shape_old[1] + 4)  # New shape with added padding
+
+        # Apply symmetric padding
+        padded_tensor = symmetric_padding(xf_old, im_shape_old, im_shape_new)
+
+        # Apply Trigonometric Resize
+        resize_layer = TrigonometricResize_2d(im_shape_new)
+        resized_tensor = resize_layer(image.unsqueeze(0))
+
+        # Plot results
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+        axs[0].imshow(image.squeeze().cpu(), cmap='gray')
+        axs[0].set_title('Original Image')
+        axs[0].axis('off')
+
+        padded_image = padded_tensor.squeeze().real.cpu().numpy()  # Get the real part of padded complex tensor for visualization
+        axs[1].imshow(padded_image, cmap='gray')
+        axs[1].set_title('Padded Image')
+        axs[1].axis('off')
+
+        axs[2].imshow(resized_tensor.squeeze().cpu().numpy(), cmap='gray')  # Convert the output back to numpy for display
+        axs[2].set_title('Trigonometric Resized Image')
+        axs[2].axis('off')
+
+        plt.show()
+
+# Generate blurred images from the training set for visualization
+with torch.no_grad():
+    # Use DataLoader for blurred images
+    blurred_sample, original_sample, label_sample = next(iter(train_loader_blur))  # Ensure we're using the blurred dataset
+    blurred_sample, original_sample = blurred_sample.to(device), original_sample.to(device)
+
+    # Visualize the padding and resizing effect
+    visualize_padding_and_resize(original_sample)  # Visualize the original images
