@@ -1,0 +1,203 @@
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.fft as fft
+import torchvision.transforms.functional as TF
+import torch.nn.functional as tf
+import torch.nn as nn
+from torch.fft import rfft2, irfft2
+
+
+# Dummy deblurred images and labels for testing
+deblurred_sample_sobolev_fno = torch.randn(64, 1, 28, 28)  # Example tensor
+deblurred_sample_sobolev_cnn = torch.randn(64, 1, 28, 28)  # Example tensor
+label_sample = torch.randint(0, 10, (64,))  # Example labels
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Dimensions to test
+new_dimensions = [(8, 8), (16, 16), (32, 32), (64, 64), (128, 128), (256, 256)]
+
+
+# 2D Fourier layer
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        super(SpectralConv2d, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+
+    def compl_mul2d(self, input, weights):
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        x_ft = rfft2(x, dim=(-2, -1))
+
+        out_ft = torch.zeros(
+            batchsize, self.out_channels, x.size(-2), x.size(-1) // 2 + 1, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2] = self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes2] = self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+
+        x = irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return x
+
+# Custom Discretization Invariant Layer
+class DiscretizationInvariantLayer(nn.Module):
+    def __init__(self, channels):
+        super(DiscretizationInvariantLayer, self).__init__()
+        self.channels = channels
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x_pooled = self.adaptive_pool(x)
+        return x - x_pooled
+
+# Fourier Neural Operator with Discretization Invariant Layers
+class FNO2d(nn.Module):
+    def __init__(self, fno_architecture, device=None, padding_frac=1 / 8):
+        super(FNO2d, self).__init__()
+        self.modes1 = fno_architecture["modes"]
+        self.modes2 = fno_architecture["modes"]
+        self.width = fno_architecture["width"]
+        self.n_layers = fno_architecture["n_layers"]
+        self.retrain_fno = fno_architecture["retrain_fno"]
+
+        torch.manual_seed(self.retrain_fno)
+        self.padding_frac = padding_frac
+        self.fc0 = nn.Conv2d(1, self.width, kernel_size=1)
+        self.conv_list = nn.ModuleList([nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_layers)])
+        self.spectral_list = nn.ModuleList([SpectralConv2d(self.width, self.width, self.modes1, self.modes2) for _ in range(self.n_layers)])
+        self.discretization_invariant_list = nn.ModuleList([DiscretizationInvariantLayer(self.width) for _ in range(self.n_layers)])
+        self.fc1 = nn.Conv2d(self.width, 128, kernel_size=1)
+        self.fc2 = nn.Conv2d(128, 1, kernel_size=1)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+        self.to(device)
+
+    def forward(self, x):
+        x = self.fc0(x)
+
+        x1_padding = int(round(x.shape[-1] * self.padding_frac))
+        x2_padding = int(round(x.shape[-2] * self.padding_frac))
+        x = F.pad(x, [x1_padding, x1_padding, x2_padding, x2_padding])
+
+        for k, (s, c, d) in enumerate(zip(self.spectral_list, self.conv_list, self.discretization_invariant_list)):
+            x1 = s(x)
+            x2 = c(x)
+            x3 = d(x)
+            x = x1 + x2 + x3
+            if k != self.n_layers - 1:
+                x = F.gelu(x)
+
+        x = x[..., x2_padding:-x2_padding, x1_padding:-x1_padding]
+
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+
+        classification_output = self.classifier(x)
+        return x, classification_output
+
+    def print_size(self):
+        nparams = 0
+        nbytes = 0
+
+        for param in self.parameters():
+            nparams += param.numel()
+            nbytes += param.data.element_size() * param.numel()
+
+        print(f'Total number of model parameters: {nparams}')
+
+        return nparams
+
+# Parameters for FNO2d
+fno_architecture = {
+    "modes": 16,
+    "width": 32,
+    "n_layers": 4,
+    "retrain_fno": 42
+}
+
+# Initialize the FNO2d model
+model_fno = FNO2d(fno_architecture, device=device).to(device)
+
+# Visualize some images
+def visualize_images(images, title_prefix, num_images=5):
+    """Display the images with their resizing dimensions labeled."""
+    fig, axs = plt.subplots(1, num_images, figsize=(15, 5))
+    for i in range(num_images):
+        axs[i].imshow(images[i].squeeze(0).cpu(), cmap='gray')
+        axs[i].set_title(f'{title_prefix}')
+        axs[i].axis('off')
+    plt.show()
+
+# Evaluate each new dimension with deblurred images from both FNO and CNN
+for new_size in new_dimensions:
+    height, width = new_size
+
+    def create_resized_dataloader(deblurred_images, labels):
+        # Ensure images are properly shaped: [N, 1, H, W]
+        if deblurred_images.ndim == 3:
+            deblurred_images = deblurred_images.unsqueeze(1)
+
+        # Rescale using F.interpolate to new dimensions
+        resized_images = F.interpolate(deblurred_images, size=(height, width), mode='bilinear', align_corners=False)
+
+        # Visualize a few images before resizing back
+        visualize_images(resized_images, f'Resized to ({height}, {width})', num_images=min(5, len(resized_images)))
+
+        # Resize back to 28x28 for model input
+        final_images = F.interpolate(resized_images, size=(28, 28), mode='bilinear', align_corners=False)
+
+        # Visualize a few images after resizing
+        visualize_images(final_images, 'Resized back to (28, 28)', num_images=min(5, len(final_images)))
+
+        # Prepare DataLoader
+        dataset = TensorDataset(final_images, labels)
+        return DataLoader(dataset, batch_size=64, shuffle=False)
+
+    # Prepare dataloaders for resized, deblurred images
+    fno_loader = create_resized_dataloader(deblurred_sample_sobolev_fno, label_sample)
+    cnn_loader = create_resized_dataloader(deblurred_sample_sobolev_cnn, label_sample)
+
+    # Evaluate models on resized images
+    for loader, model, model_name in [(fno_loader, model_fno, "FNO"), (cnn_loader, model_cnn, "CNN")]:
+        model.eval()
+        total_correct = 0
+        total_images = 0
+
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                # Get classification outputs
+                _, class_outputs = model(images)
+                _, predicted = torch.max(class_outputs, 1)
+
+                total_correct += (predicted == labels).sum().item()
+                total_images += labels.size(0)
+
+        accuracy = total_correct / total_images * 100
+        print(f"Resized from {new_size} to 28x28 - {model_name} Model Accuracy: {accuracy:.2f}%")
+
+# Checking dimensions to ensure they are correct
+print(f"FNO Deblurred Sample Shape: {deblurred_sample_sobolev_fno.shape}")
+print(f"CNN Deblurred Sample Shape: {deblurred_sample_sobolev_cnn.shape}")
