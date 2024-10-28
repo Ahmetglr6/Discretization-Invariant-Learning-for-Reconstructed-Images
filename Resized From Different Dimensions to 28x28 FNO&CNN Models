@@ -1,0 +1,77 @@
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+
+# Assuming the following variables hold your deblurred validation images:
+# deblurred_sample_sobolev_fno - Deblurred images from the FNO model
+# deblurred_sample_sobolev_cnn - Deblurred images from the CNN model
+# label_sample - Corresponding labels for these images
+
+# Dimensions to test
+new_dimensions = [(8, 8), (16, 16), (32, 32), (64, 64), (128, 128), (256, 256)]
+
+# Visualize some images
+def visualize_images(images, titles, num_images=5):
+    fig, axs = plt.subplots(1, num_images, figsize=(15, 5))
+    for i in range(num_images):
+        axs[i].imshow(images[i].squeeze(0).cpu(), cmap='gray')
+        axs[i].set_title(titles[i])
+        axs[i].axis('off')
+    plt.show()
+
+# Evaluate each new dimension with deblurred images from both FNO and CNN
+for new_size in new_dimensions:
+    height, width = new_size
+
+    def create_resized_dataloader(deblurred_images, labels):
+        # Ensure images are properly shaped: [N, 1, H, W]
+        deblurred_images = deblurred_images.cpu() if deblurred_images.is_cuda else deblurred_images
+
+        if deblurred_images.ndim == 6:
+            deblurred_images = deblurred_images.unsqueeze(1)
+
+        # Rescale using F.interpolate
+        resized_images = F.interpolate(deblurred_images, size=(height, width), mode='bilinear', align_corners=False)
+
+        # Visualize a few images before resizing back
+        visualize_images(resized_images, [f'Image {i}' for i in range(5)], min(5, len(resized_images)))
+
+        # Resize back to 28x28 for model input
+        final_images = F.interpolate(resized_images, size=(28, 28), mode='bilinear', align_corners=False)
+
+        # Visualize a few images after resizing
+        visualize_images(final_images, [f'Resized to 28: Image {i}' for i in range(5)], min(5, len(final_images)))
+
+        # Prepare DataLoader
+        dataset = TensorDataset(final_images, labels)
+        return DataLoader(dataset, batch_size=64, shuffle=False)
+
+    # Prepare dataloaders for resized, deblurred images
+    fno_loader = create_resized_dataloader(deblurred_sample_sobolev_fno, label_sample)
+    cnn_loader = create_resized_dataloader(deblurred_sample_sobolev_cnn, label_sample)
+
+    # Evaluate models on resized images
+    for loader, model, model_name in [(fno_loader, model_fno, "FNO"), (cnn_loader, model_cnn, "CNN")]:
+        model.eval()
+        total_correct = 0
+        total_images = 0
+
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                # Get classification outputs
+                _, class_outputs = model(images)
+                _, predicted = torch.max(class_outputs, 1)
+
+                total_correct += (predicted == labels).sum().item()
+                total_images += labels.size(0)
+
+        accuracy = total_correct / total_images * 100
+        
+
+# Checking dimensions to ensure they are correct
+print(deblurred_sample_sobolev_fno.shape)
+print(deblurred_sample_sobolev_cnn.shape)
